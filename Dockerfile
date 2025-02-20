@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create necessary directories
-RUN mkdir -p static converted_files models templates temp_downloads
+RUN mkdir -p static converted_files models templates temp_downloads default_files document_templates\samples processing_results
 
 # Download YOLO model (if needed)
 RUN python -c "from ultralytics import YOLO; YOLO('models/yolov10x_best.pt')"
@@ -38,4 +38,4 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Command to run the application
-CMD ["uvicorn", "main_mongodb_updated_copy:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "Opticintellect_updated:app", "--host", "0.0.0.0", "--port", "8000"]
