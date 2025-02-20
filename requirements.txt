@@ -32,3 +32,6 @@ google-cloud-aiplatform
 tabulate
 pdfplumber
 camelot
+google-generativeai
+google-genai
+aiohttp
