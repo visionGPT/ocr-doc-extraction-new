@@ -1,4 +1,5 @@
-# main_mongodb_updated copy.py
+# Opticintellect_updated.py
+import openai
 import io
 import os
 import base64
@@ -9,17 +10,22 @@ import cv2
 from ultralytics import YOLO
 import fitz
 import logging
-import openai
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import time
 import copy
-# MongoDB Connection Setup
+from fastapi import Form
+from typing import List, Dict, Any
+
 from pymongo import MongoClient
 import urllib.parse
-# Import GCS client
-from google.cloud import storage  # Import GCS client
-from urllib.parse import urlparse  # Import for URL parsing
+import aiohttp
+import time
+import os
+from motor.motor_asyncio import AsyncIOMotorClient
+
+from google.cloud import storage 
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse
@@ -27,12 +33,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.templating import Jinja2Templates
 from starlette.staticfiles import StaticFiles
 from pydantic import BaseModel
+from fastapi.datastructures import FormData
+
 
 from docx2pdf import convert
 from pptx import Presentation
 from pdf2image import convert_from_path
 import pandas as pd
-import logging
+import logging 
 import traceback
 from datetime import datetime
 from tabulate import tabulate
@@ -46,14 +54,171 @@ from reportlab.lib.pagesizes import letter
 import pdfkit
 from typing import BinaryIO
 from tempfile import SpooledTemporaryFile, TemporaryDirectory
-from typing import Dict
+from typing import Optional, List, Dict
 from wtforms import Form, FileField
 from typing import Optional
 import os
+from templates import template_manager
+
 from google.cloud import storage
 from google.oauth2 import service_account
 from google.cloud import storage
 from google.oauth2 import service_account
+
+from google.generativeai.types import GenerationConfig
+from google.generativeai import GenerativeModel, configure
+from google.genai.types import (
+    FunctionDeclaration,
+    GenerateContentConfig,
+    GoogleSearch,
+    MediaResolution,
+    Part,
+    Retrieval,
+    SafetySetting,
+    Tool,
+    ToolCodeExecution,
+    VertexAISearch,
+)
+
+
+from templates import template_manager
+MODEL_ID = "gemini-2.0-flash-001"
+configure(api_key="GOOGLE_API_KEY")
+genai_client = GenerativeModel(MODEL_ID)
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from typing import List, Tuple, Dict, Any
+from PIL import Image
+import traceback
+
+class ParallelBatchProcessor:
+    def __init__(self, max_workers: int = 8):
+        self.max_workers = max_workers
+        self.logger = logging.getLogger(__name__)
+
+    async def process_single_page(
+        self, 
+        image_info: Tuple[Image.Image, List[int], int], 
+        openai_api_key: str
+    ) -> Dict[str, Any]:
+        """
+        Process a single page of the document.
+        
+        Args:
+            image_info: Tuple containing (image, page_numbers, page_boundary)
+            openai_api_key: OpenAI API key for processing
+            
+        Returns:
+            Dict containing processing results for the page
+        """
+        try:
+            image, page_numbers, page_boundary = image_info
+            
+            # Detect elements in the image
+            result_image, detected_elements = detect(image, page_numbers, page_boundary)
+            
+            # Save annotated image
+            annotated_image_path = save_annotated_image(
+                result_image, 
+                f"annotated_page_{page_numbers[0]}.png"
+            )
+            
+            # Create chunks from detected elements
+            chunks = improved_intelligent_chunking_with_continuity(
+                detected_elements,
+                SEGMENT_HIERARCHY,
+                max_chunk_size=20
+            )
+            
+            # Process each chunk
+            processed_chunks = []
+            for chunk_idx, chunk in enumerate(chunks):
+                # Create image for chunk
+                chunk_image = combine_elements_into_image(image, chunk["elements"])
+                annotated_chunk_image, _ = detect(chunk_image)
+                
+                # Add metadata to chunk
+                chunk["chunk_index"] = chunk_idx
+                chunk["original_image"] = chunk_image
+                chunk["annotated_image"] = annotated_chunk_image
+                
+                # Process the chunk
+                processed_chunk = process_chunk(chunk, openai_api_key)
+                processed_chunks.append(processed_chunk)
+            
+            return {
+                "pages": page_numbers,
+                "processed_chunks": processed_chunks,
+                "detected_elements": detected_elements,
+                "annotated_image_path": annotated_image_path
+            }
+            
+        except Exception as e:
+            self.logger.error(
+                f"Error processing page {page_numbers}: {str(e)}\n{traceback.format_exc()}"
+            )
+            return {
+                "pages": page_numbers,
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+
+    async def process_batch(
+        self, 
+        batch: List[Tuple[Image.Image, List[int], int]], 
+        openai_api_key: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Process a batch of pages in parallel.
+        
+        Args:
+            batch: List of image_info tuples
+            openai_api_key: OpenAI API key for processing
+            
+        Returns:
+            List of processing results for the batch
+        """
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            loop = asyncio.get_event_loop()
+            tasks = [
+                loop.run_in_executor(
+                    executor,
+                    lambda x: asyncio.run(self.process_single_page(x, openai_api_key)),
+                    image_info
+                )
+                for image_info in batch
+            ]
+            return await asyncio.gather(*tasks)
+
+async def parallel_batch_process_document(
+    images_with_info: List[Tuple[Image.Image, List[int], int]], 
+    openai_api_key: str,
+    batch_size: int = 8
+) -> List[Dict[str, Any]]:
+    """
+    Process document pages in parallel batches.
+    
+    Args:
+        images_with_info: List of tuples containing (image, page_numbers, page_boundary)
+        openai_api_key: OpenAI API key for processing
+        batch_size: Number of pages to process in parallel
+        
+    Returns:
+        List of processing results for all pages
+    """
+    processor = ParallelBatchProcessor(max_workers=batch_size)
+    results = []
+    
+    # Process pages in batches
+    for i in range(0, len(images_with_info), batch_size):
+        batch = images_with_info[i:i + batch_size]
+        batch_results = await processor.process_batch(batch, openai_api_key)
+        results.extend(batch_results)
+    
+    return results
+
 
 def initialize_storage_client():
     """Initialize Google Cloud Storage client with credentials"""
@@ -159,9 +324,6 @@ FILE_ID = "1jTF4xd0Pu7FDFpLTfSGjgTTolZju4_j7"
 MODEL_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 
 
-
-
-
 # Define allowed file types and their MIME types
 ALLOWED_EXTENSIONS: Dict[str, str] = {
     'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -169,6 +331,152 @@ ALLOWED_EXTENSIONS: Dict[str, str] = {
     'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     'csv': 'text/csv'
 }
+
+DEFAULT_TEST_FILES = {
+    "invoice": "E:\\ATTACK CAPITAL\\Opticintellect-FastAPI\\default_files\\InvoiceExample.pdf",
+    "balance_sheet": "E:\\ATTACK CAPITAL\\Opticintellect-FastAPI\\default_files\\Balance Sheet.pdf",
+    "bank_statement": "E:\\ATTACK CAPITAL\\Opticintellect-FastAPI\\default_files\\Bank Statement.pdf"
+}
+
+# Create directory for default files if it doesn't exist
+if not os.path.exists("default_files"):
+    os.makedirs("default_files")
+
+PREBUILT_TEMPLATES = {
+    "invoice-template": {
+        "template_id": "invoice-template",
+        "name": "Invoice Template",
+        "description": "Template for processing invoice PDF files",
+        "type": "invoice",
+        "fields": [
+            "invoice_number",
+            "date",
+            "due_date",
+            "company_name",
+            "billing_address",
+            "line_items",
+            "subtotal",
+            "tax",
+            "total_amount"
+        ],
+        "sample_file": "templates/invoice_template.pdf"
+    },
+    "balance-sheet-template": {
+        "template_id": "balance-sheet-template",
+        "name": "Balance Sheet Template",
+        "description": "Template for processing balance sheet PDF files",
+        "type": "financial",
+        "fields": [
+            "reporting_period",
+            "assets",
+            "liabilities",
+            "equity",
+            "total_assets",
+            "total_liabilities",
+            "total_equity"
+        ],
+        "sample_file": "templates/balance_sheet_template.pdf"
+    },
+    "bank-statement-template": {
+        "template_id": "bank-statement-template",
+        "name": "Bank Statement Template",
+        "description": "Template for processing bank account statement PDF files",
+        "type": "financial",
+        "fields": [
+            "account_number",
+            "statement_period",
+            "opening_balance",
+            "closing_balance",
+            "transactions",
+            "deposits",
+            "withdrawals",
+            "fees"
+        ],
+        "sample_file": "templates/bank_statement_template.pdf"
+    }
+}
+
+class TemplateConfig(BaseModel):
+    name: str
+    description: str
+    type: str
+    fields: List[str]
+    detection_config: dict = {}
+    processing_config: dict = {}
+    chunk_config: dict = {}
+    hierarchy: List[str] = []
+
+class AsyncTemplateManager:
+    """Async Template Manager for handling document processing templates"""
+    
+    def __init__(self):
+        self.templates: Dict[str, dict] = PREBUILT_TEMPLATES
+        self._lock = asyncio.Lock()
+    
+    async def get_template(self, template_id: str) -> Optional[dict]:
+        """Get a template by ID"""
+        async with self._lock:
+            return self.templates.get(template_id)
+    
+    async def add_template(self, template_id: str, template_config: TemplateConfig) -> bool:
+        """Add a new template"""
+        async with self._lock:
+            if template_id in self.templates:
+                return False
+            self.templates[template_id] = template_config.dict()
+            return True
+    
+    async def update_template(self, template_id: str, template_config: TemplateConfig) -> bool:
+        """Update an existing template"""
+        async with self._lock:
+            if template_id not in self.templates:
+                return False
+            self.templates[template_id] = template_config.dict()
+            return True
+    
+    async def delete_template(self, template_id: str) -> bool:
+        """Delete a template"""
+        async with self._lock:
+            if template_id not in self.templates:
+                return False
+            del self.templates[template_id]
+            return True
+    
+    async def list_templates(self) -> List[dict]:
+        """List all available templates"""
+        async with self._lock:
+            return [
+                {
+                    "template_id": tid,
+                    "name": tdata["name"],
+                    "description": tdata["description"],
+                    "type": tdata["type"]
+                }
+                for tid, tdata in self.templates.items()
+            ]
+    
+    async def process_template_request(self, file: UploadFile, template_id: str, form_data: FormData) -> dict:
+        """
+        Process a template-based document request with proper form data handling
+        """
+        template = await self.get_template(template_id)
+        if not template:
+            raise ValueError(f"Template '{template_id}' not found")
+            
+        # Extract form fields based on template configuration
+        field_values = {}
+        for field in template.get('fields', []):
+            if field in form_data:
+                field_values[field] = form_data.getlist(field)
+            
+        return {
+            "template": template,
+            "file": file,
+            "fields": field_values
+        }
+        
+# Initialize template manager
+# template_manager = AsyncTemplateManager()
 
 def validate_mime_type(content_type: str) -> str:
     """Validate and return the file extension for the given MIME type."""
@@ -402,7 +710,12 @@ async def convert_to_pdf(file_content: bytes, file_type: str) -> bytes:
                 detail=f"Document conversion failed: {str(e)}"
             )
 
-    
+
+DEFAULT_TEST_FILES = {
+    "invoice": "E:\\ATTACK CAPITAL\\Opticintellect-FastAPI\\default_files\\InvoiceExample.pdf",
+    "balance_sheet": "E:\\ATTACK CAPITAL\\Opticintellect-FastAPI\\default_files\\Balance Sheet.pdf",
+    "bank_statement": "E:\\ATTACK CAPITAL\\Opticintellect-FastAPI\\default_files\\Bank Statement.pdf"
+}   
 
 # Add Jinja2 Templates for rendering
 templates = Jinja2Templates(directory="templates")
@@ -411,22 +724,16 @@ templates = Jinja2Templates(directory="templates")
 class OpenAIConfig(BaseModel):
     api_key: str
 
-# # Modify the app to include CORS and static files
-# app = FastAPI(title="Document Extraction API")
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# # Add static file serving for images
-# app.mount("/static", StaticFiles(directory="static"), name="static")
-
 # Global variables
 openai_config = None
 DETECTION_MODEL = None
+
+# Configuration model for Google API
+class GoogleAPIConfig(BaseModel):
+    api_key: str
+
+# Global configuration variable
+google_api_config = None
 
 def save_annotated_image(image, filename="annotated_image.png"):
     """
@@ -539,7 +846,7 @@ def detect(image, page_numbers=None, page_boundary=None):
 
 def format_table_as_markdown(table_data):
     """
-    Convert table data to well-structured markdown format.
+    Convert table data to well-structured markdown format with proper alignment and spacing.
     """
     if not table_data or 'raw_data' not in table_data:
         return "Error: Invalid table data"
@@ -547,28 +854,47 @@ def format_table_as_markdown(table_data):
     header = table_data['raw_data']['header']
     data = table_data['raw_data']['data']
 
-    # Calculate column widths
-    col_widths = [len(str(h)) for h in header]
+    # Clean and standardize data
+    header = [str(h).strip() if h is not None else '' for h in header]
+    cleaned_data = []
     for row in data:
-        for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(str(cell)))
+        cleaned_row = [str(cell).strip() if cell is not None else '' for cell in row]
+        if any(cleaned_row):  # Skip entirely empty rows
+            cleaned_data.append(cleaned_row)
 
-    # Create header row
-    md_table = "| " + " | ".join(str(h).ljust(w) for h, w in zip(header, col_widths)) + " |\n"
+    # Calculate column widths
+    col_widths = [len(h) for h in header]
+    for row in cleaned_data:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
     
-    # Create separator row
-    md_table += "|" + "|".join("-" * (w + 2) for w in col_widths) + "|\n"
+    # Add padding to column widths
+    col_widths = [w + 2 for w in col_widths]  # Add 2 spaces padding per column
+
+    # Create header row with proper spacing
+    header_cells = [f" {h.ljust(w-2)} " for h, w in zip(header, col_widths)]
+    md_table = "|" + "|".join(header_cells) + "|\n"
     
-    # Create data rows
-    for row in data:
-        md_table += "| " + " | ".join(str(cell).ljust(w) for cell, w in zip(row, col_widths)) + " |\n"
+    # Create separator row with proper alignment indicators
+    separator_cells = ['-' * w for w in col_widths]
+    md_table += "|" + "|".join(separator_cells) + "|\n"
+    
+    # Create data rows with proper spacing
+    for row in cleaned_data:
+        # Ensure row has same number of columns as header
+        while len(row) < len(header):
+            row.append('')
+        
+        # Format each cell with proper spacing
+        formatted_cells = [f" {cell.ljust(w-2)} " for cell, w in zip(row, col_widths)]
+        md_table += "|" + "|".join(formatted_cells) + "|\n"
     
     return md_table
 
 
 def extract_tables_with_pdfplumber(pdf_content):
     """
-    Extract tables from PDF using pdfplumber with markdown formatting.
+    Extract tables from PDF using pdfplumber with improved markdown formatting.
     """
     tables = []
     try:
@@ -577,31 +903,23 @@ def extract_tables_with_pdfplumber(pdf_content):
                 page_tables = page.extract_tables()
                 for table_num, table in enumerate(page_tables, 1):
                     if table:
-                        # Clean and format table data
-                        cleaned_table = []
-                        for row in table:
-                            cleaned_row = [
-                                str(cell).strip() if cell is not None else ''
-                                for cell in row
-                            ]
-                            cleaned_table.append(cleaned_row)
+                        # Clean and standardize table data
+                        header = [str(cell).strip() if cell is not None else '' for cell in table[0]]
+                        data = []
+                        for row in table[1:]:
+                            cleaned_row = [str(cell).strip() if cell is not None else '' for cell in row]
+                            if any(cleaned_row):  # Skip entirely empty rows
+                                data.append(cleaned_row)
 
-                        # Remove empty rows and columns
-                        non_empty_rows = [
-                            row for row in cleaned_table 
-                            if any(cell.strip() for cell in row)
-                        ]
-
-                        if non_empty_rows:
-                            # Format table data
+                        if header and data:  # Only process non-empty tables
                             table_data = {
                                 'raw_data': {
-                                    'header': non_empty_rows[0],
-                                    'data': non_empty_rows[1:]
+                                    'header': header,
+                                    'data': data
                                 }
                             }
                             
-                            # Convert to markdown
+                            # Convert to properly formatted markdown
                             markdown_table = format_table_as_markdown(table_data)
                             
                             tables.append({
@@ -619,28 +937,39 @@ def extract_tables_with_pdfplumber(pdf_content):
 
 def extract_tables_with_camelot(pdf_path):
     """
-    Extract tables from PDF using Camelot with markdown formatting.
+    Extract tables from PDF using Camelot with improved markdown formatting.
     """
     tables = []
     try:
         camelot_tables = camelot.read_pdf(pdf_path, pages='all', flavor='stream')
         for i, table in enumerate(camelot_tables):
-            table_data = {
-                'raw_data': {
-                    'header': table.df.columns.tolist(),
-                    'data': table.df.values.tolist()
+            df = table.df
+            
+            # Clean and standardize header and data
+            header = [str(col).strip() for col in df.columns]
+            data = []
+            for _, row in df.iterrows():
+                cleaned_row = [str(cell).strip() for cell in row]
+                if any(cleaned_row):  # Skip entirely empty rows
+                    data.append(cleaned_row)
+
+            if header and data:  # Only process non-empty tables
+                table_data = {
+                    'raw_data': {
+                        'header': header,
+                        'data': data
+                    }
                 }
-            }
-            
-            # Convert to markdown
-            markdown_table = format_table_as_markdown(table_data)
-            
-            tables.append({
-                'page': table.page,
-                'table_number': i + 1,
-                'content': markdown_table,
-                'raw_data': table_data['raw_data']
-            })
+                
+                # Convert to properly formatted markdown
+                markdown_table = format_table_as_markdown(table_data)
+                
+                tables.append({
+                    'page': table.page,
+                    'table_number': i + 1,
+                    'content': markdown_table,
+                    'raw_data': table_data['raw_data']
+                })
     except Exception as e:
         logging.error(f"Error extracting tables with Camelot: {str(e)}")
         return []
@@ -657,81 +986,114 @@ def clean_table_formatting(table_content):
 
 def process_chunk(chunk, openai_api_key):
     """
-    Process a single chunk of the document.
-    Updated to handle tables using pdfplumber and Camelot when appropriate.
+    Enhanced chunk processing without summary generation.
     """
-    annotated_image = chunk["annotated_image"]
-    chunk_classes = [element["class"] for element in chunk["elements"]]
-    dominant_class = determine_dominant_class(chunk_classes)
-    prompt = get_prompt_for_class(dominant_class)
-
-    img_str = encode_image(annotated_image)
-    image_data = f"data:image/png;base64,{img_str}"
-
-    content = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": image_data, "detail": "auto"}},
-    ]
-
-    openai.api_key = openai_api_key
-
+    MAX_RETRIES = 3
+    BASE_DELAY = 2  # Base delay in seconds
+    
     try:
-        if dominant_class == "Table":
+        annotated_image = chunk["annotated_image"]
+        chunk_classes = [element["class"] for element in chunk["elements"]]
+        dominant_class = determine_dominant_class(chunk_classes)
+        
+        # Get enhanced prompts
+        system_instruction, prompt = get_prompt_for_class(dominant_class)
+        
+        # Convert image to base64
+        img_str = encode_image(annotated_image)
+        
+        # Create enhanced Gemini prompt parts
+        prompt_parts = [
+            {"text": system_instruction},
+            {"text": prompt},
+            {"text": "Important: Extract ALL content completely without any omissions."},
+            {"inline_data": {
+                "mime_type": "image/png",
+                "data": img_str
+            }}
+        ]
+
+        # Initialize variables for retry loop
+        retry_count = 0
+        last_error = None
+        
+        while retry_count < MAX_RETRIES:
             try:
-                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_pdf:
-                    annotated_image.save(tmp_pdf.name, 'PDF')
-                    tmp_pdf_path = tmp_pdf.name
-
-                # First try pdfplumber
-                with open(tmp_pdf_path, 'rb') as pdf_file:
-                    pdf_content = pdf_file.read()
-                    tables = extract_tables_with_pdfplumber(pdf_content)
-
-                if not tables:  # Fallback to Camelot if pdfplumber finds no tables
-                    tables = extract_tables_with_camelot(tmp_pdf_path)
-
-                if tables:
-                    # Clean the table formatting
-                    extracted_content = clean_table_formatting(tables[0]['content'])
-                else:
-                    response = openai.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": content}],
-                        max_tokens=3000,
-                    )
-                    extracted_content = clean_table_formatting(response.choices[0].message.content.strip())
-
-                os.unlink(tmp_pdf_path)
-
-            except Exception as e:
-                logging.error(f"Error processing table chunk: {str(e)}")
-                response = openai.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": content}],
-                    max_tokens=3000,
+                # Configure Gemini with optimized parameters
+                generation_config = GenerationConfig(
+                    temperature=0.1,
+                    top_p=0.99,
+                    top_k=40,
+                    max_output_tokens=8000,
+                    candidate_count=1
                 )
-                extracted_content = clean_table_formatting(response.choices[0].message.content.strip())
-        else:
-            response = openai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": content}],
-                max_tokens=3000,
-            )
-            extracted_content = response.choices[0].message.content.strip()
-
-        summary = generate_summary_for_extracted_content(extracted_content, openai_api_key)
-
+                
+                # Process with Gemini
+                response = genai_client.generate_content(
+                    prompt_parts,
+                    generation_config=generation_config,
+                    safety_settings=[
+                        {
+                            "category": "HARM_CATEGORY_DANGEROUS",
+                            "threshold": "BLOCK_NONE"
+                        }
+                    ]
+                )
+                
+                # Validate and ensure complete extraction
+                extracted_content = response.text.strip()
+                
+                # If content seems truncated, try extracting again with different parameters
+                if len(extracted_content.split()) < 10 or extracted_content.endswith('...'):
+                    generation_config.temperature = 0.2
+                    generation_config.top_p = 1.0
+                    response = genai_client.generate_content(
+                        prompt_parts,
+                        generation_config=generation_config
+                    )
+                    extracted_content = response.text.strip()
+                
+                return {
+                    "chunk_index": chunk["chunk_index"],
+                    "class": dominant_class,
+                    "result": extracted_content,
+                    "elements": chunk["elements"],
+                }
+                
+            except Exception as e:
+                last_error = e
+                retry_count += 1
+                
+                if "429" in str(e) or "quota" in str(e).lower():
+                    delay = BASE_DELAY * (2 ** (retry_count - 1))
+                    logging.warning(f"Rate limit hit, retrying in {delay} seconds...")
+                    time.sleep(delay)
+                    continue
+                    
+                logging.error(f"Chunk processing error (attempt {retry_count}): {str(e)}")
+                if retry_count < MAX_RETRIES:
+                    time.sleep(BASE_DELAY)
+                    continue
+                else:
+                    break
+        
+        error_msg = f"Error after {MAX_RETRIES} retries: {str(last_error)}"
+        logging.error(error_msg)
+        return {
+            "chunk_index": chunk.get("chunk_index", -1),
+            "class": dominant_class,
+            "result": error_msg,
+            "elements": chunk.get("elements", []),
+        }
+        
     except Exception as e:
-        extracted_content = f"Error processing chunk: {str(e)}"
-        summary = f"Error generating summary: {str(e)}"
-
-    return {
-        "chunk_index": chunk["chunk_index"],
-        "class": dominant_class,
-        "result": extracted_content,
-        "summary": summary,
-        "elements": chunk["elements"],
-    }
+        logging.error(f"Unexpected error in chunk processing: {str(e)}\n{traceback.format_exc()}")
+        return {
+            "chunk_index": chunk.get("chunk_index", -1),
+            "class": dominant_class if 'dominant_class' in locals() else "Unknown",
+            "result": f"Unexpected error: {str(e)}",
+            "elements": chunk.get("elements", []),
+        }
 
 
 def process_pdf(pdf_document):
@@ -816,62 +1178,153 @@ def encode_image(image):
 
 def get_prompt_for_class(cls):
     """
-    Get the prompt for a given class.
+    Get the system instruction and prompt for a given class.
+    Returns a tuple of (system_instruction, prompt)
     """
     prompts = {
-        "Text": "Extract the text from the provided image. Print only the extracted text.",
-        "Section-header": "Extract the text from the provided image. Print only the extracted text.",
-        "Title": "Extract the text from the provided image. Print only the extracted text.",
-        "Caption": "Extract the text from the provided image. Print only the extracted text.",
-        "Footnote": "Extract the text from the provided image. Print only the extracted text.",
-        "Page-header": "Extract the text from the provided image. Print only the extracted text.",
-        "Page-footer": "Extract the text from the provided image. Print only the extracted text.",
-        "List-item": "Extract the text from the provided image. Print only the extracted text.",
-        "Table": """Extract and format the table from the provided image as a markdown table following these rules:
-            1. Use proper markdown table syntax with headers and alignments
-            2. Maintain the structure and content alignment
-            3. Ensure proper spacing and formatting
-            4. Include all headers and data cells
+        "Text": (
+            """You are a precise text extraction assistant. Your task is to extract ALL text content completely and accurately, without omitting any information. Always ensure you capture the full context and complete paragraphs.""",
+            """Please extract ALL text content from this image with these requirements:
+            1. Extract every single word and sentence completely
+            2. Maintain original paragraph structure and formatting
+            3. Do not summarize or truncate content
+            4. Include all contextual information
+            5. Extract content exactly as shown, without any omissions
             
-            Example markdown table format:
+            Return the complete extracted text content:"""
+        ),
+        "Section-header": (
+            """You are a section header extraction specialist. Extract complete headers with their full context.""",
+            """Extract ALL section headers from this image with these requirements:
+            1. Include complete header text
+            2. Maintain any subheaders or related context
+            3. Preserve formatting and hierarchy
+            4. Do not truncate or summarize
+            
+            Return the complete headers:"""
+        ),
+        "Skills": (
+            """You are a skills extraction specialist. Extract ALL skills mentioned completely.""",
+            """Extract ALL skills from this image with these requirements:
+            1. Include every single skill mentioned
+            2. Include both technical and soft skills
+            3. Maintain original grouping/categorization
+            4. Do not omit any skills
+            5. Extract complete skill descriptions if present
+            
+            Return the complete list of skills:"""
+        ),
+        "Title": (
+            "You are a title extraction expert using Gemini AI. Extract titles with precise formatting.",
+            "Extract and return only the title text from this image, maintaining original emphasis and style."
+        ),
+        "Caption": (
+            "You are a caption extraction specialist using Gemini AI. Extract captions with context.",
+            "Extract and return only the caption text from this image, preserving its relationship to content."
+        ),
+        "Footnote": (
+            "You are a footnote extraction expert using Gemini AI. Extract footnotes with references.",
+            "Extract and return only the footnote text from this image, including reference markers."
+        ),
+        "Page-header": (
+            "You are a page header extraction specialist using Gemini AI. Extract headers precisely.",
+            "Extract and return only the page header text from this image, maintaining formatting."
+        ),
+        "Page-footer": (
+            "You are a page footer extraction specialist using Gemini AI. Extract footers exactly.",
+            "Extract and return only the page footer text from this image, preserving format and structure."
+        ),
+        "List-item": (
+            "You are a list extraction expert using Gemini AI. Extract lists with structure.",
+            "Extract and return only the list item text from this image, maintaining bullets/numbers and hierarchy."
+        ),
+        "Table": (
+            """You are a table extraction specialist focused on creating perfectly formatted markdown tables.""",
+            """Extract and format ALL tables from this image as markdown tables, following these strict requirements:
+            1. Use precise markdown table syntax with proper cell alignment
+            2. Include table headers with correct formatting
+            3. Use consistent column widths based on content
+            4. Add proper spacing within cells
+            5. Ensure clean data presentation
+            
+            Required markdown table format:
 
             | Header 1    | Header 2    | Header 3    |
             |------------|-------------|-------------|
             | Data 1     | Data 2      | Data 3      |
             | Long Data  | Short Data  | Medium Data |
-            
-            Extract the table maintaining this markdown structure while preserving original content and alignment.""",
-        "Picture": "Extract any text or tables present in the image and print only the extracted text.",
-        "Formula": "Simplify the mathematical formula shown in the provided image. Print only the simplified latex formula if possible.",
-        "Unknown": "Extract any recognizable content from the provided image and print only the extracted content.",
-    }
-    return prompts.get(cls, "Extract any recognizable content from the provided image and print only the extracted content.")
 
-def generate_summary_for_extracted_content(extracted_content, openai_api_key):
-    """
-    Generate a summary for the extracted content using the current OpenAI API syntax.
-    """
-    prompt = f"Summarize the following content in a concise manner:\n\n{extracted_content}"
-    
-    # Initialize OpenAI client
-    openai.api_key = openai_api_key
-
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
+            Extract ALL tables following this exact format. Maintain proper alignment and spacing.
+            Do not truncate or omit any content."""
+        ),
+        "Picture": (
+            "You are an image content specialist using Gemini AI. Extract visual content accurately.",
+            "Extract and describe any text or data present in this image, focusing on accuracy and completeness."
+        ),
+        "Formula": (
+            "You are a formula extraction expert using Gemini AI. Convert to LaTeX when possible.",
+            "Extract and convert the mathematical formula to LaTeX format if possible. Return only the formula."
+        ),
+        "Unknown": (
+            "You are a general content extraction specialist using Gemini AI. Extract all content types.",
+            "Extract any recognizable content from this image with high accuracy. Return only the extracted content."
         )
-        summary = response.choices[0].message.content.strip()
+    }
+    return prompts.get(cls, (
+        "You are a complete content extraction specialist. Extract ALL content without omissions.",
+        "Extract ALL content from this image completely and accurately. Do not truncate or summarize any information."
+    ))
+
+def generate_overall_summary(results, openai_api_key, max_retries=3, base_delay=1):
+    """
+    Generate an overall summary for the entire document
+    """
+    try:
+        # Combine all extracted content
+        all_content = ""
+        for page in results:
+            for chunk in page['processed_chunks']:
+                if chunk.get('result'):
+                    all_content += chunk['result'] + "\n\n"
+
+        client = openai.OpenAI(api_key=openai_api_key)
+        
+        for attempt in range(max_retries):
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini", 
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": """You are a comprehensive document summarization expert. Create a short
+                            summary capturing key points, main themes, and important details from the document. 
+                            Structure your summary with clear sections and highlight critical information."""
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Please provide a detailed summary of this document:\n\n{all_content}"
+                        }
+                    ],
+                    max_tokens=1000,  
+                    temperature=0.3,
+                )
+                
+                return response.choices[0].message.content.strip()
+                
+            except Exception as e:
+                if "rate_limit" in str(e).lower() and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
+                raise e
+                
     except Exception as e:
-        summary = f"Error generating summary: {str(e)}"
-        print(f"Error generating summary: {str(e)}")
-    
-    return summary
+        logging.error(f"Overall summary generation error: {str(e)}")
+        return f"Error generating overall summary: {str(e)}"
 
 def improved_intelligent_chunking_with_continuity(detected_elements, hierarchy, max_chunk_size=5):
     """
-    Optimized grouping of detected elements into fewer chunks with content continuity.
+    Optimized chunking strategy with increased chunk size for better performance
     """
     chunks = []
     current_chunk_elements = []
@@ -880,17 +1333,23 @@ def improved_intelligent_chunking_with_continuity(detected_elements, hierarchy, 
 
     def should_start_new_chunk(element, current_priority):
         element_priority = priorities.get(element["class"], len(hierarchy))
+        
+        # Skip chunking for elements that don't need summaries
+        if element["class"] in [
+            "Section-header", "Title", "Caption", "Footnote", 
+            "Page-header", "Page-footer", "Unknown"
+        ]:
+            return True
+            
         return (
-            len(current_chunk_elements) >= max_chunk_size or  # Increased max chunk size
-            element["class"] == "Section-header" or  # Always start a new chunk for section headers
-            (current_priority is not None and 
-             (abs(element_priority - current_priority) > 5 or  # Wider priority gap
-              element["class"] in ["Title", "Page-header", "Page-footer"]))  # Specific classes to trigger new chunk
+            len(current_chunk_elements) >= max_chunk_size or
+            element["class"] in ["Section-header", "Title", "Skills"] or
+            (current_priority is not None and abs(element_priority - current_priority) > 3)
         )
 
     for element in detected_elements:
         if should_start_new_chunk(element, current_priority):
-            if current_chunk_elements:  # Only add non-empty chunks
+            if current_chunk_elements:
                 chunks.append({"elements": current_chunk_elements})
                 current_chunk_elements = []
             current_priority = priorities.get(element["class"], len(hierarchy))
@@ -901,32 +1360,14 @@ def improved_intelligent_chunking_with_continuity(detected_elements, hierarchy, 
     if current_chunk_elements:
         chunks.append({"elements": current_chunk_elements})
 
-    # Aggressive chunk merging
-    merged_chunks = []
-    current_merged_chunk = None
+    return chunks
 
-    for chunk in chunks:
-        if current_merged_chunk is None:
-            current_merged_chunk = chunk
-        elif len(current_merged_chunk["elements"]) + len(chunk["elements"]) <= 10:  # Increased merge limit
-            # Merge chunks if total elements are 10 or less
-            current_merged_chunk["elements"].extend(chunk["elements"])
-        else:
-            merged_chunks.append(current_merged_chunk)
-            current_merged_chunk = chunk
-
-    # Add the last chunk
-    if current_merged_chunk:
-        merged_chunks.append(current_merged_chunk)
-
-    return merged_chunks
-
-def batch_process_chunks(chunks, openai_api_key, batch_size=32):
+def batch_process_chunks(chunks, openai_api_key, batch_size=64):
     """
-    Process chunks in parallel batches to improve response time.
+    Process chunks in larger parallel batches for improved performance
     """
     async def process_batch(batch):
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=min(32, len(batch))) as executor:
             loop = asyncio.get_event_loop()
             tasks = [
                 loop.run_in_executor(executor, process_chunk, chunk, openai_api_key)
@@ -944,7 +1385,7 @@ def batch_process_chunks(chunks, openai_api_key, batch_size=32):
 
 def format_results_as_markdown(results):
     """
-    Convert processing results to markdown format
+    Convert processing results to markdown format with optimized summary display
     """
     markdown_output = "# Document Extraction Results\n\n"
     
@@ -961,10 +1402,45 @@ def format_results_as_markdown(results):
         for chunk_index, chunk in enumerate(page_result['processed_chunks'], 1):
             markdown_output += f"#### Chunk {chunk_index} (Type: {chunk['class']})\n\n"
             markdown_output += f"**Extracted Content:**\n```\n{chunk['result']}\n```\n\n"
-            markdown_output += f"**Summary:**\n{chunk['summary']}\n\n"
+            
+            # Only display summary if it exists and is not empty
+            if chunk.get('summary'):
+                markdown_output += f"**Summary:**\n{chunk['summary']}\n\n"
+            
             markdown_output += "---\n\n"
     
     return markdown_output
+
+def initialize_gemini(api_key: str):
+    """Initialize Gemini with improved configuration."""
+    try:
+        global genai_client
+        configure(api_key=api_key)
+        
+        # Create model with specific configuration
+        genai_client = GenerativeModel(
+            MODEL_ID,
+            generation_config=GenerationConfig(
+                temperature=0.1,
+                top_p=0.95,
+                top_k=20,
+                max_output_tokens=4000,
+                candidate_count=1
+            )
+        )
+        
+        # Test the model with a simple prompt
+        test_response = genai_client.generate_content("Test connection")
+        if test_response and hasattr(test_response, 'text'):
+            logging.info("Gemini model initialized successfully")
+            return True
+        else:
+            logging.error("Gemini model initialization failed: Invalid response format")
+            return False
+            
+    except Exception as e:
+        logging.error(f"Failed to initialize Gemini: {str(e)}")
+        return False
 
 # Modify the app to include CORS and static files
 app = FastAPI(title="Document Extraction API")
@@ -976,6 +1452,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize template manager
+template_manager = AsyncTemplateManager()
 
 # Modify the upload page route to include filename input
 @app.get("/", response_class=HTMLResponse)
@@ -1016,6 +1494,43 @@ async def initialize_openai(config: OpenAIConfig):
     global openai_config
     openai_config = config
     return {"message": "OpenAI configuration initialized successfully"}
+
+@app.post("/initialize-google-api")
+async def initialize_google_api(config: GoogleAPIConfig):
+    """
+    Endpoint to set Google API configuration and initialize Gemini model
+    """
+    try:
+        global google_api_config
+        google_api_config = config
+        
+        if initialize_gemini(config.api_key):
+            return {
+                "status": "success",
+                "message": "Google API configuration initialized successfully",
+                "model": MODEL_ID
+            }
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to initialize Gemini model"
+            )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initialize Google API configuration: {str(e)}"
+        )
+    
+# Helper function to check if API is configured
+def check_api_configured():
+    """Check if the Google API is configured"""
+    if not google_api_config:
+        raise HTTPException(
+            status_code=400,
+            detail="Google API key not initialized. Please call /initialize-google-api first."
+        )
+    return True
 
 
 # Create a directory for storing converted files
@@ -1130,77 +1645,50 @@ async def process_document(
         )
 
         # Process images and collect results
-        results = []
-        annotated_image_paths = []
+        try:
+            results = await parallel_batch_process_document(images_with_info, openai_config.api_key)
+
+            # Collect annotated image paths
+            annotated_image_paths = [
+                result['annotated_image_path'] 
+                for result in results 
+                if 'annotated_image_path' in result
+            ]
+
+            # Update MongoDB with progress
+            for idx, result in enumerate(results):
+                if 'error' in result:
+                    collection.update_one(
+                        {"file_id": file_id},
+                        {"$set": {
+                            f"page_{idx}_status": "failed",
+                            f"page_{idx}_error": result['error']
+                        }}
+                    )
+                else:
+                    collection.update_one(
+                        {"file_id": file_id},
+                        {"$set": {
+                            f"page_{idx}_status": "completed"
+                        }}
+                    )
+                    
+        except Exception as e:
+            logger.error(f"Error in parallel processing: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error in parallel processing: {str(e)}")
         
-        for idx, (image, page_numbers, page_boundary) in enumerate(images_with_info):
-            try:
-                # Detect elements
-                result_image, detected_elements = detect(image, page_numbers, page_boundary)
-
-                # Save annotated image
-                annotated_image_path = save_annotated_image(result_image, f"annotated_page_{idx}.png")
-                annotated_image_paths.append(annotated_image_path)
-
-                # Create and process chunks
-                chunks = improved_intelligent_chunking_with_continuity(
-                    detected_elements, 
-                    SEGMENT_HIERARCHY, 
-                    max_chunk_size=10
-                )
-
-                processed_chunks = []
-                for chunk_idx, chunk in enumerate(chunks):
-                    chunk_image = combine_elements_into_image(image, chunk["elements"])
-                    annotated_chunk_image, _ = detect(chunk_image)
-
-                    chunk["chunk_index"] = chunk_idx
-                    chunk["original_image"] = chunk_image
-                    chunk["annotated_image"] = annotated_chunk_image
-
-                    processed_chunk = process_chunk(chunk, openai_config.api_key)
-                    processed_chunks.append(processed_chunk)
-
-                # Collect results for this page
-                page_result = {
-                    "pages": page_numbers,
-                    "processed_chunks": processed_chunks,
-                    "detected_elements": detected_elements,
-                    "annotated_image_path": annotated_image_path
-                }
-                results.append(page_result)
-
-                # Update MongoDB with page progress
-                collection.update_one(
-                    {"file_id": file_id},
-                    {"$set": {
-                        f"pages_processed": idx + 1,
-                        f"page_{idx}_status": "completed"
-                    }}
-                )
-
-            except Exception as page_error:
-                # Log page processing error but continue with other pages
-                collection.update_one(
-                    {"file_id": file_id},
-                    {"$set": {
-                        f"page_{idx}_status": "failed",
-                        f"page_{idx}_error": str(page_error)
-                    }}
-                )
-                logger.error(f"Error processing page {idx}: {str(page_error)}")
-                continue
+        overall_summary = generate_overall_summary(results, openai_config.api_key)
 
         # Update final results in MongoDB
         final_update = {
             "status": "completed",
             "result": "Processing complete",
             "chunks": results,
+            "overall_summary": overall_summary,
             "completed_at": datetime.utcnow(),
             "annotated_image_paths": annotated_image_paths,
             "total_chunks_processed": sum(len(page["processed_chunks"]) for page in results)
         }
-
         collection.update_one(
             {"file_id": file_id},
             {"$set": final_update}
@@ -1220,10 +1708,11 @@ async def process_document(
                 "request": {"type": "http.request", "method": "POST"},
                 "file_name": display_filename,
                 "results": results,
+                "overall_summary": overall_summary,
                 "annotated_image_paths": annotated_image_paths,
-                "file_id": file_id,  # Include file_id in the template context
+                "file_id": file_id,
                 "gcs_url": gcs_url,
-                "message": f"File ID for this document: {file_id}"  # Add a message with the file_id
+                "message": f"File ID for this document: {file_id}"
             }
         )
 
@@ -1430,6 +1919,7 @@ async def get_response(
             raise HTTPException(status_code=404, detail="Response not found")
         
         return ProcessResponse(
+        
             result=response_data["result"],
             chunks=response_data["chunks"],
             gcs_url=response_data.get("gcs_url")
@@ -1442,7 +1932,228 @@ async def get_response(
         # Log and raise any other unexpected errors
         logger.error(f"Unexpected error in get_response: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    
+@app.get("/list-templates")
+async def list_templates():
+    """
+    List all available document templates
+    """
+    templates = await template_manager.list_templates()
+    return templates
 
+@app.get("/template/{template_id}")
+async def get_template(template_id: str):
+    """
+    Get a specific template by ID
+    """
+    template = await template_manager.get_template(template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return template
+
+@app.post("/process-with-template", response_class=HTMLResponse)
+async def process_with_template(
+    template_id: str = Query(..., description="ID of the template to use"),
+    test_file_type: str = Query(..., description="Type of test file to use", enum=["invoice", "balance_sheet", "bank_statement"])
+):
+    """
+    Process a document using a specific template with enhanced extraction and summary generation.
+    Only supports default test files.
+    """
+    try:
+        # Check if OpenAI configuration is set
+        if not openai_config:
+            raise HTTPException(status_code=400, detail="OpenAI API key not initialized")
+
+        # Handle test file selection
+        if test_file_type not in DEFAULT_TEST_FILES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid test_file_type. Allowed values: {list(DEFAULT_TEST_FILES.keys())}"
+            )
+
+        file_path = DEFAULT_TEST_FILES[test_file_type]
+        if not os.path.exists(file_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Default test file {test_file_type} not found. Please ensure default files are properly configured."
+            )
+
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        
+        filename = os.path.basename(file_path)
+        file_type = "application/pdf"
+        display_filename = filename
+
+        # Generate a unique file_id for tracking
+        file_id = f"{int(time.time())}_{filename}"
+
+        # Get template configuration
+        template = await template_manager.get_template(template_id)
+        if not template:
+            raise HTTPException(status_code=404, detail="Template not found")
+
+        # Upload file to GCS
+        file_name = f"{int(time.time())}_{filename}"
+        blob = bucket.blob(file_name)
+        blob.upload_from_string(content)
+        gcs_url = f"https://storage.googleapis.com/{bucket_name}/{file_name}"
+
+        # Create initial MongoDB document
+        initial_doc = {
+            "file_id": file_id,
+            "gcs_url": gcs_url,
+            "status": "processing",
+            "result": "Processing started",
+            "chunks": [],
+            "file_name": filename,
+            "template_id": template_id,
+            "template_config": template,
+            "created_at": datetime.utcnow(),
+            "is_test_file": True,
+            "test_file_type": test_file_type
+        }
+        collection.insert_one(initial_doc)
+
+        # Process the PDF content
+        pdf_document = fitz.open(stream=content, filetype="pdf")
+        images_with_info = process_pdf(pdf_document)
+
+        # Update MongoDB with processing started
+        collection.update_one(
+            {"file_id": file_id},
+            {"$set": {
+                "status": "processing_pages",
+                "total_pages": len(images_with_info)
+            }}
+        )
+
+        # Process images and collect results
+        results = []
+        annotated_image_paths = []
+        
+        for idx, (image, page_numbers, page_boundary) in enumerate(images_with_info):
+            try:
+                # Detect elements
+                result_image, detected_elements = detect(image, page_numbers, page_boundary)
+
+                # Save annotated image
+                annotated_image_path = save_annotated_image(result_image, f"annotated_page_{idx}.png")
+                annotated_image_paths.append(annotated_image_path)
+
+                # Create and process chunks
+                chunks = improved_intelligent_chunking_with_continuity(
+                    detected_elements, 
+                    SEGMENT_HIERARCHY, 
+                    max_chunk_size=10
+                )
+
+                processed_chunks = []
+                for chunk_idx, chunk in enumerate(chunks):
+                    chunk_image = combine_elements_into_image(image, chunk["elements"])
+                    annotated_chunk_image, _ = detect(chunk_image)
+
+                    chunk["chunk_index"] = chunk_idx
+                    chunk["original_image"] = chunk_image
+                    chunk["annotated_image"] = annotated_chunk_image
+
+                    processed_chunk = process_chunk(chunk, openai_config.api_key)
+                    processed_chunks.append(processed_chunk)
+
+                # Collect results for this page
+                page_result = {
+                    "pages": page_numbers,
+                    "processed_chunks": processed_chunks,
+                    "detected_elements": detected_elements,
+                    "annotated_image_path": annotated_image_path
+                }
+                results.append(page_result)
+
+                # Update MongoDB with page progress
+                collection.update_one(
+                    {"file_id": file_id},
+                    {"$set": {
+                        "pages_processed": idx + 1,
+                        f"page_{idx}_status": "completed"
+                    }}
+                )
+
+            except Exception as page_error:
+                collection.update_one(
+                    {"file_id": file_id},
+                    {"$set": {
+                        f"page_{idx}_status": "failed",
+                        f"page_{idx}_error": str(page_error)
+                    }}
+                )
+                logger.error(f"Error processing page {idx}: {str(page_error)}")
+                continue
+
+        overall_summary = generate_overall_summary(results, openai_config.api_key)
+
+        # Update final results in MongoDB
+        final_update = {
+            "status": "completed",
+            "result": "Processing complete",
+            "chunks": results,
+            "overall_summary": overall_summary,
+            "completed_at": datetime.utcnow(),
+            "annotated_image_paths": annotated_image_paths,
+            "total_chunks_processed": sum(len(page["processed_chunks"]) for page in results)
+        }
+
+        collection.update_one(
+            {"file_id": file_id},
+            {"$set": final_update}
+        )
+
+        # Return the HTML response with file_id included
+        return templates.TemplateResponse(
+            "results.html",
+            {
+                "request": {"type": "http.request", "method": "POST"},
+                "file_name": display_filename,
+                "results": results,
+                "overall_summary": overall_summary,
+                "annotated_image_paths": annotated_image_paths,
+                "file_id": file_id,
+                "gcs_url": gcs_url,
+                "template_id": template_id,
+                "message": f"File ID for this document: {file_id}"
+            }
+        )
+
+    except HTTPException as he:
+        if 'file_id' in locals():
+            collection.update_one(
+                {"file_id": file_id},
+                {"$set": {
+                    "status": "failed",
+                    "error": str(he),
+                    "error_code": he.status_code,
+                    "completed_at": datetime.utcnow()
+                }}
+            )
+        raise he
+
+    except Exception as e:
+        if 'file_id' in locals():
+            collection.update_one(
+                {"file_id": file_id},
+                {"$set": {
+                    "status": "failed",
+                    "error": str(e),
+                    "error_traceback": traceback.format_exc(),
+                    "completed_at": datetime.utcnow()
+                }}
+            )
+        logger.error(f"Error processing document: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+
+    finally:
+        if 'pdf_document' in locals():
+            pdf_document.close()
 
 
 @app.delete("/delete-document/{file_id}")
